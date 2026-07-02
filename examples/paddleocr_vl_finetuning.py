@@ -254,9 +254,12 @@ def apply_lora(model):
             "k_proj",
             "v_proj",
             "o_proj",
+            "out_proj",
             "gate_proj",
             "up_proj",
             "down_proj",
+            "fc1",
+            "fc2",
         ],
         use_rslora=False,
         # --- Vision-specific flags ---
@@ -498,7 +501,7 @@ def evaluate_ocr_benchmark(
                 add_generation_prompt=True,
             )
             inputs = tokenizer(
-                [input_text],
+                text=[input_text],
                 images=[image],
                 return_tensors="pt",
                 padding=True,
@@ -507,11 +510,10 @@ def evaluate_ocr_benchmark(
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                temperature=1.0,
-                min_p=0.1,
-                do_sample=True,
+                do_sample=False,
             )
-            decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            generated_ids = outputs[0][inputs.input_ids.shape[-1]:]
+            decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
             predictions.append(decoded)
         except Exception as e:
             if verbose:

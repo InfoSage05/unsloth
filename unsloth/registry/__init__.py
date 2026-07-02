@@ -19,7 +19,7 @@ def register_models():
     _register_gemma_models()
     _register_llama_models()
     _register_mistral_models()
-    _register_paddleocr_models()
+    _register_paddleocr_models(include_original_model=True)
     _register_phi_models()
     _register_qwen_models()
 
