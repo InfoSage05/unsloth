@@ -597,6 +597,9 @@ def _preserve_tokenizer_eos_token(
     sync with the source tokenizer without failing the save if the config is not
     present or cannot be edited.
 
+    Also cleans up invalid tokenizer_class entries like 'TokenizersBackend' that break
+    vLLM and AutoTokenizer loading.
+
     `filename_prefix` mirrors the same argument on Transformers'
     `PreTrainedTokenizerBase.save_pretrained`: when provided, the tokenizer
     config is written as `{filename_prefix}-tokenizer_config.json` instead of
@@ -609,9 +612,6 @@ def _preserve_tokenizer_eos_token(
     eos_token = getattr(source_tokenizer, "eos_token", None)
     if eos_token is None and source_tokenizer is not tokenizer:
         eos_token = getattr(tokenizer, "eos_token", None)
-    if eos_token is None:
-        return
-    eos_token = str(eos_token)
 
     tokenizer_config_name = (
         f"{filename_prefix}-tokenizer_config.json" if filename_prefix else "tokenizer_config.json"
@@ -624,16 +624,29 @@ def _preserve_tokenizer_eos_token(
         with open(tokenizer_config, "r", encoding = "utf-8") as file:
             config = json.load(file)
 
-        if config.get("eos_token") == eos_token:
-            return
+        modified = False
+        if eos_token is not None and str(eos_token) != config.get("eos_token"):
+            config["eos_token"] = str(eos_token)
+            modified = True
 
-        config["eos_token"] = eos_token
-        with open(tokenizer_config, "w", encoding = "utf-8") as file:
-            json.dump(config, file, indent = 2, ensure_ascii = False)
-            file.write("\n")
+        tok_class = config.get("tokenizer_class", None)
+        invalid_classes = ("TokenizersBackend", "Tokenizer", "PyBackend")
+        if tok_class in invalid_classes or tok_class is None or not isinstance(tok_class, str):
+            real_class = getattr(source_tokenizer, "tokenizer_class", None)
+            if not real_class or real_class in invalid_classes:
+                real_class = type(source_tokenizer).__name__
+            if not real_class or real_class in invalid_classes:
+                real_class = "PreTrainedTokenizerFast"
+            config["tokenizer_class"] = real_class
+            modified = True
+
+        if modified:
+            with open(tokenizer_config, "w", encoding = "utf-8") as file:
+                json.dump(config, file, indent = 2, ensure_ascii = False)
+                file.write("\n")
     except Exception as error:
         logger.warning_once(
-            f"Unsloth: Could not preserve tokenizer eos_token in {tokenizer_config}: {error}"
+            f"Unsloth: Could not preserve tokenizer config in {tokenizer_config}: {error}"
         )
 
 
@@ -676,6 +689,53 @@ def _qwen3_5_vlm_state_dict_for_save(state_dict):
             new_key = key
         remapped_state_dict[new_key] = value
     return remapped_state_dict
+
+
+def _remap_qwen3_5_vlm_saved_weights(save_directory):
+    """Remap saved state_dict keys in save_directory for Qwen3.5 VLM so that vLLM and Hugging Face
+    can load merged weights without key mismatch errors."""
+    import glob
+    if save_directory is None or not os.path.isdir(str(save_directory)):
+        return
+
+    save_directory = str(save_directory)
+
+    try:
+        from safetensors.torch import load_file, save_file
+        st_files = glob.glob(os.path.join(save_directory, "*.safetensors"))
+        for filepath in st_files:
+            try:
+                state_dict = load_file(filepath)
+                needs_remap = any(
+                    k.startswith("language_model.model.")
+                    or k.startswith("visual.")
+                    or k.startswith("language_model.lm_head.")
+                    for k in state_dict.keys()
+                )
+                if needs_remap:
+                    remapped = _qwen3_5_vlm_state_dict_for_save(state_dict)
+                    save_file(remapped, filepath)
+            except Exception as e:
+                logger.warning_once(f"Unsloth: Could not remap Qwen3.5 VLM weights in {filepath}: {e}")
+    except ImportError:
+        pass
+
+    pt_files = glob.glob(os.path.join(save_directory, "*.bin"))
+    for filepath in pt_files:
+        try:
+            state_dict = torch.load(filepath, map_location = "cpu")
+            if isinstance(state_dict, dict):
+                needs_remap = any(
+                    k.startswith("language_model.model.")
+                    or k.startswith("visual.")
+                    or k.startswith("language_model.lm_head.")
+                    for k in state_dict.keys()
+                )
+                if needs_remap:
+                    remapped = _qwen3_5_vlm_state_dict_for_save(state_dict)
+                    torch.save(remapped, filepath)
+        except Exception as e:
+            logger.warning_once(f"Unsloth: Could not remap Qwen3.5 VLM weights in {filepath}: {e}")
 
 
 def _coerce_tied_weights_keys_to_dict(model):
@@ -4169,6 +4229,8 @@ def unsloth_generic_save(
             low_disk_space_usage = True,
             use_temp_file = False,
         )
+        if _is_qwen3_5_vlm(model):
+            _remap_qwen3_5_vlm_saved_weights(save_directory)
 
     if push_to_hub and datasets:
         try:
