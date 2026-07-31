@@ -16,6 +16,7 @@ import {
 import type {
   CachedInventoryRow,
   DiscoverRow,
+  InventoryRow,
   LocalInventoryRow,
   ModelsTab,
 } from "../types";
@@ -54,6 +55,7 @@ export interface ModelsCatalogState {
   hasMore: boolean;
   manualFetchAvailable: boolean;
   hasActiveFilters: boolean;
+  typeFilterActive: boolean;
 }
 
 export interface ModelsCatalogPagination {
@@ -69,6 +71,7 @@ export interface ModelsCatalogHandlers {
   onRetry: () => void;
   onInventoryChange?: () => void;
   onSwitchDevice?: () => void;
+  onOpenModelSettings?: (row: InventoryRow) => void;
 }
 
 function assignRef<T>(ref: RefObject<T | null>, value: T | null) {
@@ -117,6 +120,7 @@ export const ModelsCatalog = memo(function ModelsCatalog({
     loadingIntentCount,
     hasMore,
     hasActiveFilters,
+    typeFilterActive,
   } = state;
   const { scrollRef, sentinelRef, isLoadingMore } = pagination;
   const {
@@ -126,6 +130,7 @@ export const ModelsCatalog = memo(function ModelsCatalog({
     onRetry,
     onInventoryChange,
     onSwitchDevice,
+    onOpenModelSettings,
   } = handlers;
   const [scrolled, setScrolled] = useState(false);
   const [streamingActive, setStreamingActive] = useState(false);
@@ -469,6 +474,8 @@ export const ModelsCatalog = memo(function ModelsCatalog({
                 downloadedReady={downloadedReady}
                 inventoryError={inventoryError}
                 query={query}
+                typeFilterActive={typeFilterActive}
+                onClearFilters={onClearFilters}
                 scrollElement={downloadedScrollEl}
                 activeCheckpoint={activeCheckpoint}
                 activeGgufVariant={activeGgufVariant}
@@ -479,6 +486,7 @@ export const ModelsCatalog = memo(function ModelsCatalog({
                 columns={discoverView === "two" ? 2 : 1}
                 sort={inventorySort}
                 onInventoryChange={onInventoryChange}
+                onOpenModelSettings={onOpenModelSettings}
               />
             </div>
           ) : (

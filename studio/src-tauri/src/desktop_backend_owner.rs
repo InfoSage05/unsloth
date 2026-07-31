@@ -14,6 +14,9 @@ static TEST_METADATA: std::sync::Mutex<Option<DesktopBackendMetadata>> =
 
 pub(crate) const OWNER_TOKEN_ENV: &str = "UNSLOTH_STUDIO_DESKTOP_OWNER_TOKEN";
 pub(crate) const OWNER_KIND_ENV: &str = "UNSLOTH_STUDIO_DESKTOP_OWNER_KIND";
+// The app's own pid, so the backend can watch the exact owner process instead
+// of sampling getppid (racy under a subreaper when the app dies mid-startup).
+pub(crate) const OWNER_PID_ENV: &str = "UNSLOTH_STUDIO_DESKTOP_OWNER_PID";
 pub(crate) const OWNER_KIND_TAURI: &str = "tauri";
 
 const METADATA_SCHEMA_VERSION: u8 = 1;
@@ -93,7 +96,7 @@ enum PreviousAppPidStatus {
     Uncertain,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct HealthDesktopOwner {
     kind: Option<String>,
     token_sha256: Option<String>,
@@ -101,15 +104,7 @@ struct HealthDesktopOwner {
 
 #[derive(Debug, Deserialize)]
 struct HealthResponse {
-    status: Option<String>,
-    service: Option<String>,
     version: Option<String>,
-    desktop_protocol_version: Option<u16>,
-    desktop_manageability_version: Option<u16>,
-    supports_desktop_auth: Option<bool>,
-    supports_desktop_backend_ownership: Option<bool>,
-    studio_root_id: Option<String>,
-    desktop_owner: Option<HealthDesktopOwner>,
 }
 
 #[derive(Debug)]
@@ -121,6 +116,18 @@ struct SimpleHttpResponse {
 #[derive(Serialize)]
 struct DesktopLoginPayload<'a> {
     secret: &'a str,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct DesktopLiveness {
+    status: Option<String>,
+    service: Option<String>,
+    desktop_protocol_version: Option<u16>,
+    desktop_manageability_version: Option<u16>,
+    supports_desktop_auth: Option<bool>,
+    supports_desktop_backend_ownership: Option<bool>,
+    studio_root_id: Option<String>,
+    desktop_owner: Option<HealthDesktopOwner>,
 }
 
 #[derive(Deserialize)]
@@ -290,10 +297,10 @@ impl BackendOwnerState {
     }
 
     pub(crate) fn verifies_exact_port_blocking(&self, port: u16) -> bool {
-        match fetch_health_blocking(port) {
-            Ok(Some(health)) => {
-                health_verifies_metadata(&health, &self.metadata)
-                    && lifecycle_control_block_reason(&health).is_none()
+        match fetch_liveness_blocking(port) {
+            Ok(Some(liveness)) => {
+                liveness_verifies_metadata(&liveness, &self.metadata)
+                    && lifecycle_control_block_reason(&liveness).is_none()
             }
             _ => false,
         }
@@ -498,66 +505,110 @@ pub(crate) fn test_owner_state(root_id: &str, token: &str, port: u16) -> Backend
     }
 }
 
-fn health_verifies_metadata(health: &HealthResponse, metadata: &DesktopBackendMetadata) -> bool {
-    let healthy = health.status.as_deref() == Some("healthy")
-        && health.service.as_deref() == Some("Unsloth UI Backend");
-    let Some(owner) = health.desktop_owner.as_ref() else {
+fn liveness_verifies_metadata(
+    liveness: &DesktopLiveness,
+    metadata: &DesktopBackendMetadata,
+) -> bool {
+    let alive = matches!(liveness.status.as_deref(), Some("alive") | Some("healthy"))
+        && liveness.service.as_deref() == Some("Unsloth UI Backend");
+    let Some(owner) = liveness.desktop_owner.as_ref() else {
         return false;
     };
-    healthy
+    alive
         && owner_matches_metadata(
             metadata,
-            health.studio_root_id.as_deref(),
+            liveness.studio_root_id.as_deref(),
             owner.kind.as_deref(),
             owner.token_sha256.as_deref(),
         )
 }
 
-fn lifecycle_control_block_reason(health: &HealthResponse) -> Option<String> {
-    if health.desktop_protocol_version != Some(crate::preflight::DESKTOP_PROTOCOL_VERSION) {
+fn lifecycle_control_block_reason(liveness: &DesktopLiveness) -> Option<String> {
+    if liveness.desktop_protocol_version != Some(crate::preflight::DESKTOP_PROTOCOL_VERSION) {
         return Some("desktop_protocol_incompatible".to_string());
     }
-    if health.supports_desktop_auth != Some(true) {
+    if liveness.supports_desktop_auth != Some(true) {
         return Some("desktop_auth_unsupported".to_string());
     }
-    if health.desktop_manageability_version.unwrap_or(0)
-        < crate::preflight::DESKTOP_MANAGEABILITY_VERSION
+    if liveness.desktop_manageability_version.unwrap_or(0)
+        < crate::preflight::DESKTOP_BACKEND_MANAGEABILITY_VERSION
     {
         return Some("desktop_manageability_unsupported".to_string());
     }
-    if health.supports_desktop_backend_ownership != Some(true) {
+    if liveness.supports_desktop_backend_ownership != Some(true) {
         return Some("desktop_backend_ownership_unsupported".to_string());
     }
     None
 }
 
-fn ready_for_use_status(health: &HealthResponse) -> OwnedBackendReadiness {
-    match crate::preflight::backend_version_stale_reason(health.version.as_deref()) {
+fn ready_for_use_status(health: Option<&HealthResponse>) -> OwnedBackendReadiness {
+    let version = health
+        .and_then(|h| h.version.as_deref())
+        .filter(|v| !v.is_empty());
+    match crate::preflight::backend_version_stale_reason(version) {
         Some(reason) => OwnedBackendReadiness::Stale { reason },
         None => OwnedBackendReadiness::Ready,
     }
 }
 
-async fn fetch_health(port: u16) -> Result<Option<HealthResponse>, reqwest::Error> {
+async fn health_ready_status(port: u16) -> OwnedBackendReadiness {
+    match fetch_health(port).await {
+        Ok(health) => ready_for_use_status(health.as_ref()),
+        Err(reason) => OwnedBackendReadiness::Stale { reason },
+    }
+}
+
+async fn fetch_liveness(port: u16) -> Result<Option<DesktopLiveness>, reqwest::Error> {
     let client = reqwest::Client::builder()
         .timeout(LOCAL_HTTP_TIMEOUT)
         .build()?;
+    for path in ["/api/liveness", "/api/health"] {
+        let response = client
+            .get(format!("http://127.0.0.1:{port}{path}"))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND && path == "/api/liveness" {
+            continue;
+        }
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        return response.json::<DesktopLiveness>().await.map(Some);
+    }
+    Ok(None)
+}
+
+fn fetch_liveness_blocking(port: u16) -> Result<Option<DesktopLiveness>, String> {
+    for path in ["/api/liveness", "/api/health"] {
+        let response = http_request_blocking(port, "GET", path, &[], &[])?;
+        if response.status == 404 && path == "/api/liveness" {
+            continue;
+        }
+        if !(200..300).contains(&response.status) {
+            return Ok(None);
+        }
+        return serde_json::from_slice::<DesktopLiveness>(&response.body)
+            .map(Some)
+            .map_err(|e| e.to_string());
+    }
+    Ok(None)
+}
+async fn fetch_health(port: u16) -> Result<Option<HealthResponse>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(LOCAL_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
     let response = client
         .get(format!("http://127.0.0.1:{port}/api/health"))
         .send()
-        .await?;
+        .await
+        .map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Ok(None);
     }
-    response.json::<HealthResponse>().await.map(Some)
-}
-
-fn fetch_health_blocking(port: u16) -> Result<Option<HealthResponse>, String> {
-    let response = http_request_blocking(port, "GET", "/api/health", &[], &[])?;
-    if !(200..300).contains(&response.status) {
-        return Ok(None);
-    }
-    serde_json::from_slice::<HealthResponse>(&response.body)
+    response
+        .json::<HealthResponse>()
+        .await
         .map(Some)
         .map_err(|e| e.to_string())
 }
@@ -618,21 +669,21 @@ pub(crate) async fn probe_owned_backend_state(
     };
     let mut verified = Vec::new();
     for port in ports {
-        let health = match fetch_health(port).await {
-            Ok(Some(health)) => health,
+        let liveness = match fetch_liveness(port).await {
+            Ok(Some(liveness)) => liveness,
             Ok(None) => continue,
             Err(error) => {
                 warn!(
-                    "Desktop-owned backend probe skipped port {} after health error: {}",
+                    "Desktop-owned backend probe skipped port {} after liveness error: {}",
                     port, error
                 );
                 continue;
             }
         };
-        if !health_verifies_metadata(&health, &owner.metadata) {
+        if !liveness_verifies_metadata(&liveness, &owner.metadata) {
             continue;
         }
-        if let Some(reason) = lifecycle_control_block_reason(&health) {
+        if let Some(reason) = lifecycle_control_block_reason(&liveness) {
             return OwnedBackendProbe::Unmanageable { port, reason };
         }
         if !desktop_login_route_compatible(port).await {
@@ -646,7 +697,7 @@ pub(crate) async fn probe_owned_backend_state(
                 return OwnedBackendProbe::Unmanageable { port, reason };
             }
         }
-        verified.push((port, ready_for_use_status(&health)));
+        verified.push((port, health_ready_status(port).await));
     }
 
     if verified.len() != 1 {
@@ -966,15 +1017,12 @@ mod tests {
         assert!(!metadata_is_well_formed(&metadata));
     }
 
-    #[test]
-    fn health_verification_requires_root_kind_and_token_sha() {
-        let metadata = metadata(1, Some(8888));
-        let health = HealthResponse {
-            status: Some("healthy".to_string()),
+    fn owned_liveness(manageability: u16) -> DesktopLiveness {
+        DesktopLiveness {
+            status: Some("alive".to_string()),
             service: Some("Unsloth UI Backend".to_string()),
-            version: Some("2026.5.2".to_string()),
             desktop_protocol_version: Some(1),
-            desktop_manageability_version: Some(1),
+            desktop_manageability_version: Some(manageability),
             supports_desktop_auth: Some(true),
             supports_desktop_backend_ownership: Some(true),
             studio_root_id: Some(ROOT_ID.to_string()),
@@ -982,13 +1030,63 @@ mod tests {
                 kind: Some(OWNER_KIND_TAURI.to_string()),
                 token_sha256: Some(token_sha256(TOKEN)),
             }),
-        };
-        assert!(health_verifies_metadata(&health, &metadata));
+        }
+    }
 
-        let mut wrong_root = health;
+    #[test]
+    fn legacy_manageability_backend_stays_lifecycle_controllable() {
+        // A backend from the previous app version reports manageability 1.
+        // studio_install_ok is CLI-side, not part of this backend's HTTP
+        // contract: blocking makes preflight answer ExternalConflict and never
+        // adopt a process the root id and token already prove is ours.
+        assert_eq!(lifecycle_control_block_reason(&owned_liveness(1)), None);
+        assert_eq!(
+            lifecycle_control_block_reason(&owned_liveness(
+                crate::preflight::DESKTOP_MANAGEABILITY_VERSION
+            )),
+            None
+        );
+
+        // The bits a live backend really must carry are still enforced.
+        let mut no_ownership = owned_liveness(1);
+        no_ownership.supports_desktop_backend_ownership = Some(false);
+        assert_eq!(
+            lifecycle_control_block_reason(&no_ownership).as_deref(),
+            Some("desktop_backend_ownership_unsupported")
+        );
+
+        let mut no_auth = owned_liveness(1);
+        no_auth.supports_desktop_auth = Some(false);
+        assert_eq!(
+            lifecycle_control_block_reason(&no_auth).as_deref(),
+            Some("desktop_auth_unsupported")
+        );
+
+        let mut old_protocol = owned_liveness(1);
+        old_protocol.desktop_protocol_version = Some(0);
+        assert_eq!(
+            lifecycle_control_block_reason(&old_protocol).as_deref(),
+            Some("desktop_protocol_incompatible")
+        );
+
+        let mut no_manageability = owned_liveness(1);
+        no_manageability.desktop_manageability_version = None;
+        assert_eq!(
+            lifecycle_control_block_reason(&no_manageability).as_deref(),
+            Some("desktop_manageability_unsupported")
+        );
+    }
+
+    #[test]
+    fn liveness_verification_requires_root_kind_and_token_sha() {
+        let metadata = metadata(1, Some(8888));
+        let liveness = owned_liveness(1);
+        assert!(liveness_verifies_metadata(&liveness, &metadata));
+
+        let mut wrong_root = liveness;
         wrong_root.studio_root_id =
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
-        assert!(!health_verifies_metadata(&wrong_root, &metadata));
+        assert!(!liveness_verifies_metadata(&wrong_root, &metadata));
     }
 
     #[tokio::test]
