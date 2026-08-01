@@ -651,18 +651,28 @@ def _preserve_tokenizer_eos_token(
 
 
 def _is_qwen3_5_vlm(model):
-    config = getattr(model, "config", None)
-    if config is None or not hasattr(config, "vision_config"):
-        return False
-    architectures = getattr(config, "architectures", None) or ()
-    return any(
-        architecture
-        in (
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-        )
-        for architecture in architectures
-    ) or getattr(config, "model_type", None) in ("qwen3_5", "qwen3_5_moe")
+    models = [model]
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None:
+        base_model = getattr(base_model, "model", base_model)
+        if base_model is not model:
+            models.append(base_model)
+
+    for candidate in models:
+        config = getattr(candidate, "config", None)
+        if config is None or not hasattr(config, "vision_config"):
+            continue
+        architectures = getattr(config, "architectures", None) or ()
+        if any(
+            architecture
+            in (
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
+            for architecture in architectures
+        ) or getattr(config, "model_type", None) in ("qwen3_5", "qwen3_5_moe"):
+            return True
+    return False
 
 
 def _is_gpt_oss(model):

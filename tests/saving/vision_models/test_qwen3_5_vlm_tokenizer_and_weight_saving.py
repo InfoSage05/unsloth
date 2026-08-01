@@ -15,6 +15,7 @@ if "unsloth_zoo" not in sys.modules:
     sys.modules["unsloth_zoo"] = mock_zoo
     sys.modules["unsloth_zoo.saving_utils"] = MagicMock()
     sys.modules["unsloth_zoo.llama_cpp"] = MagicMock()
+    sys.modules["unsloth_zoo.device_type"] = MagicMock()
 
 import os
 import json
@@ -65,6 +66,20 @@ def test_qwen3_5_vlm_detection():
         config = DummyConfig()
 
     assert _is_qwen3_5_vlm(DummyModel()) is True
+
+
+def test_qwen3_5_vlm_detection_through_peft_wrapper():
+    class DummyConfig:
+        vision_config = {}
+        architectures = ["Qwen3_5ForConditionalGeneration"]
+
+    class DummyBaseModel:
+        config = DummyConfig()
+
+    class DummyPeftModel:
+        base_model = DummyBaseModel()
+
+    assert _is_qwen3_5_vlm(DummyPeftModel()) is True
 
 
 def test_qwen3_5_vlm_state_dict_remapping():
